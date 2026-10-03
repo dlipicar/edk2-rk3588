@@ -57,8 +57,9 @@ EFI_STATUS
 typedef struct {
   //
   // TRUE when a USB Power Delivery contract was negotiated. When FALSE the
-  // remaining fields describe what Type-C current advertisement alone allows,
-  // which is what a port without PD is limited to.
+  // remaining fields may describe Type-C current advertisement. Zero voltage
+  // and current mean the supply is unconfirmed: a failed PD exchange does not
+  // prove that a previously negotiated supply has returned to 5 V.
   //
   BOOLEAN    PdNegotiated;
   UINT32     VoltageMv;

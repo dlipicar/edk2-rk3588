@@ -457,7 +457,8 @@ STATIC struct RK_FUSB302_DEVICE {
       .SelfPowered = FALSE,
       .SinkPdos    = {
         PDO_FIXED (5000, 3000, PDO_FIXED_USB_COMM | PDO_FIXED_DATA_SWAP),
-        PDO_VAR (5000, 20000, 5000)
+        // Limit this unvalidated firmware policy to ordinary 3 A cables.
+        PDO_VAR (5000, 20000, 3000)
       }
     }
   }
