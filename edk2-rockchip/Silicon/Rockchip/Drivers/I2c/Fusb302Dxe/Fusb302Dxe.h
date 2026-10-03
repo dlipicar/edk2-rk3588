@@ -179,7 +179,8 @@
   ((UINT32)((((ObjectPosition) & 0x7) << 28)            | \
             (((((OperatingMa) / 10)) & 0x3FF) << 10)    | \
             (((MaxMa) / 10) & 0x3FF)                    | \
-            BIT25 /* USB communications capable */ ))
+            BIT25 /* USB communications capable */ | \
+            BIT24 /* Cannot suspend the board to USB suspend current */ ))
 
 #define PD_MAX_DATA_OBJECTS                 7
 
@@ -217,6 +218,11 @@
 #define PD_PS_TRANSITION_TIMEOUT_US         (600 * 1000)
 
 #define PD_POLL_INTERVAL_US                 500
+
+// tSinkRequest is at least 100 ms after a Wait response.
+#define PD_SINK_REQUEST_RETRY_US            (100 * 1000)
+#define PD_SINK_WAIT_RETRY_LIMIT            2
+#define PD_SINK_REQUEST_LIMIT               (PD_MAX_DATA_OBJECTS * (PD_SINK_WAIT_RETRY_LIMIT + 1))
 
 //
 // Vendor defined messages. Only structured VDMs are used here.
@@ -428,6 +434,8 @@ typedef struct {
   // Rolling message ID for messages this driver sends, per the specification.
   //
   UINT8                       MessageId;
+  UINT8                       ReceivedMessageId;
+  BOOLEAN                     ReceivedMessageValid;
 } FUSB302_CONTEXT;
 
 #define FUSB302_SC_FROM_TYPEC_PORT(a) \

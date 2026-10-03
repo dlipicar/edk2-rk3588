@@ -3,16 +3,12 @@
 *  USB Power Delivery sink negotiation over the FUSB302.
 *
 *  This runs once, synchronously, while the port controller driver starts. A
-*  background state machine would be the natural shape for an OS driver, but
-*  firmware only needs to establish a contract the once, and a blocking
-*  sequence avoids doing I2C from a timer callback -- every transfer on this
-*  controller raises to TPL_HIGH_LEVEL, which would block the very timer
-*  driving the machine.
+*  blocking sequence establishes the initial contract before peripheral load
+*  is enabled. It does not service policy messages after driver startup; a
+*  persistent state machine is needed for that separate lifetime requirement.
 *
-*  The timing this has to meet is modest because the FUSB302 answers incoming
-*  messages with GoodCRC in hardware (SWITCHES1.AUTO_GCRC), covering
-*  tReceiverResponse of 15 ms. Firmware is left with tSenderResponse, 30 ms,
-*  which a 500 us poll meets with room to spare.
+*  The FUSB302 answers incoming messages with GoodCRC in hardware
+*  (SWITCHES1.AUTO_GCRC). Firmware polls every 500 us for policy messages.
 *
 *  This is the sinking half. Sourcing lives in Fusb302Source.c, and the two
 *  share the message handling here: replies take their power role from the
@@ -145,6 +141,7 @@ Fusb302PdEnable (
   }
 
   Context->MessageId = 0;
+  Context->ReceivedMessageValid = FALSE;
 
   return EFI_SUCCESS;
 }
@@ -159,6 +156,7 @@ Fusb302PdDisable (
   IN FUSB302_CONTEXT  *Context
   )
 {
+  ZeroMem (&Context->Contract, sizeof (Context->Contract));
   Fusb302RegWrite (Context, FUSB302_REG_SWITCHES1, PD_REV_2_0 << FUSB302_SWITCHES1_SPECREV_SHIFT);
   Fusb302RegWrite (
     Context,
@@ -327,7 +325,10 @@ Fusb302PdReceive (
   // drained out of the FIFO.
   //
   for (ByteIndex = 0; ByteIndex < 4; ByteIndex++) {
-    Fusb302RegRead (Context, FUSB302_REG_FIFOS, &Byte);
+    Status = Fusb302RegRead (Context, FUSB302_REG_FIFOS, &Byte);
+    if (EFI_ERROR (Status)) {
+      return Status;
+    }
   }
 
   return EFI_SUCCESS;
@@ -378,12 +379,11 @@ Fusb302PdSendControl (
   to a Hard Reset, which drops the rail and costs us the contract and any
   alternate mode along with it.
 
-  Whatever exchange was in flight is over either way; the caller sees its own
-  wait time out and decides what to do next.
+  The caller must abandon the interrupted exchange and await new capabilities.
 
 **/
 STATIC
-VOID
+EFI_STATUS
 Fusb302PdAcceptSoftReset (
   IN OUT FUSB302_CONTEXT  *Context
   )
@@ -394,16 +394,17 @@ Fusb302PdAcceptSoftReset (
   // Both counters restart, and the Accept itself carries the first ID.
   //
   Context->MessageId = 0;
+  Context->ReceivedMessageValid = FALSE;
+  ZeroMem (&Context->Contract, sizeof (Context->Contract));
 
   Status = Fusb302PdSendControl (Context, PD_CTRL_ACCEPT);
   if (EFI_ERROR (Status)) {
     DEBUG ((DEBUG_WARN, "%a: could not accept Soft_Reset (%r)\n", __func__, Status));
-    return;
+    return Status;
   }
 
-  Context->Contract.PdNegotiated = FALSE;
-
   DEBUG ((DEBUG_INFO, "%a: accepted Soft_Reset; message IDs restart\n", __func__));
+  return EFI_MEDIA_CHANGED;
 }
 
 /**
@@ -418,7 +419,7 @@ Fusb302PdAcceptSoftReset (
 
 **/
 STATIC
-VOID
+EFI_STATUS
 Fusb302PdRejectRequest (
   IN OUT FUSB302_CONTEXT  *Context,
   IN     UINT8            Type
@@ -429,10 +430,11 @@ Fusb302PdRejectRequest (
   Status = Fusb302PdSendControl (Context, PD_CTRL_REJECT);
   if (EFI_ERROR (Status)) {
     DEBUG ((DEBUG_WARN, "%a: could not reject message type %u (%r)\n", __func__, (UINT32)Type, Status));
-    return;
+    return Status;
   }
 
   DEBUG ((DEBUG_INFO, "%a: rejected message type %u\n", __func__, (UINT32)Type));
+  return EFI_SUCCESS;
 }
 
 /**
@@ -443,13 +445,12 @@ Fusb302PdRejectRequest (
   exchange and ignores everything that follows it, alternate mode entry
   included. That is the same failure a repeated Source_Capabilities caused.
 
-  Failure to reply is logged rather than propagated. The question is the
-  partner's, not ours, and losing the answer costs no less than never having
-  sent one.
+  Propagate transport failures: the source may reset when its question goes
+  unanswered, so the caller cannot report the exchange as settled.
 
 **/
 STATIC
-VOID
+EFI_STATUS
 Fusb302PdAnswerGetSinkCap (
   IN OUT FUSB302_CONTEXT  *Context
   )
@@ -467,8 +468,7 @@ Fusb302PdAnswerGetSinkCap (
   // reason the question is answered at all.
   //
   if (Count == 0) {
-    Fusb302PdRejectRequest (Context, PD_CTRL_GET_SINK_CAP);
-    return;
+    return Fusb302PdRejectRequest (Context, PD_CTRL_GET_SINK_CAP);
   }
 
   Header = PD_HEADER_BUILD (
@@ -483,7 +483,7 @@ Fusb302PdAnswerGetSinkCap (
   Status = Fusb302PdSend (Context, Header, Pdos);
   if (EFI_ERROR (Status)) {
     DEBUG ((DEBUG_WARN, "%a: could not answer Get_Sink_Cap (%r)\n", __func__, Status));
-    return;
+    return Status;
   }
 
   Context->MessageId = (Context->MessageId + 1) & 0x7;
@@ -494,6 +494,7 @@ Fusb302PdAnswerGetSinkCap (
     __func__,
     (UINT32)Count
     ));
+  return EFI_SUCCESS;
 }
 
 /**
@@ -505,7 +506,7 @@ Fusb302PdAnswerGetSinkCap (
 
 **/
 STATIC
-VOID
+EFI_STATUS
 Fusb302PdAnswerGetSourceCap (
   IN OUT FUSB302_CONTEXT  *Context
   )
@@ -517,8 +518,7 @@ Fusb302PdAnswerGetSourceCap (
   Pdo = Fusb302SourcePdo (Context);
 
   if (Context->PartnerIsSource || (Pdo == 0)) {
-    Fusb302PdRejectRequest (Context, PD_CTRL_GET_SOURCE_CAP);
-    return;
+    return Fusb302PdRejectRequest (Context, PD_CTRL_GET_SOURCE_CAP);
   }
 
   Header = PD_HEADER_BUILD (
@@ -533,12 +533,43 @@ Fusb302PdAnswerGetSourceCap (
   Status = Fusb302PdSend (Context, Header, &Pdo);
   if (EFI_ERROR (Status)) {
     DEBUG ((DEBUG_WARN, "%a: could not answer Get_Source_Cap (%r)\n", __func__, Status));
-    return;
+    return Status;
   }
 
   Context->MessageId = (Context->MessageId + 1) & 0x7;
 
   DEBUG ((DEBUG_INFO, "%a: answered Get_Source_Cap with 0x%08x\n", __func__, Pdo));
+  return EFI_SUCCESS;
+}
+
+/**
+  Invalidate the interrupted exchange before looking at queued messages.
+**/
+STATIC
+EFI_STATUS
+Fusb302PdHandlePartnerHardReset (
+  IN OUT FUSB302_CONTEXT  *Context
+  )
+{
+  EFI_STATUS  Status;
+
+  DEBUG ((DEBUG_INFO, "%a: partner sent Hard Reset\n", __func__));
+  Context->DataRoleDfp = FALSE;
+  Context->MessageId = 0;
+  Context->ReceivedMessageValid = FALSE;
+  ZeroMem (&Context->Contract, sizeof (Context->Contract));
+  Status = Fusb302PdResetLogic (Context);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = Fusb302RegUpdate (Context, FUSB302_REG_SWITCHES1, FUSB302_SWITCHES1_DATAROLE, 0);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = Fusb302RegUpdate (Context, FUSB302_REG_CONTROL1, FUSB302_CONTROL1_RX_FLUSH, FUSB302_CONTROL1_RX_FLUSH);
+  return EFI_ERROR (Status) ? Status : EFI_PROTOCOL_ERROR;
 }
 
 /**
@@ -576,27 +607,18 @@ Fusb302PdWaitFor (
   TimeoutNs = MultU64x32 (TimeoutUs, 1000);
 
   while (GetTimeInNanoSecond (GetPerformanceCounter () - Start) < TimeoutNs) {
+    // A reset invalidates even messages still queued in the receive FIFO.
+    Status = Fusb302RegRead (Context, FUSB302_REG_INTERRUPTA, &InterruptA);
+    if (EFI_ERROR (Status)) {
+      return Status;
+    }
+
+    if ((InterruptA & FUSB302_INTERRUPTA_HARDRESET) != 0) {
+      return Fusb302PdHandlePartnerHardReset (Context);
+    }
+
     Status = Fusb302PdReceive (Context, Message);
     if (Status == EFI_NOT_READY) {
-      //
-      // A Hard Reset from the partner never reaches the FIFO. Pick it up
-      // here and reset the PD logic, or nothing the source sends next is
-      // received. Whatever we were waiting for is not coming: the caller
-      // has to start over from the source's next advertisement.
-      //
-      if (!EFI_ERROR (Fusb302RegRead (Context, FUSB302_REG_INTERRUPTA, &InterruptA)) &&
-          ((InterruptA & FUSB302_INTERRUPTA_HARDRESET) != 0))
-      {
-        DEBUG ((DEBUG_INFO, "%a: partner sent Hard Reset\n", __func__));
-        Fusb302PdResetLogic (Context);
-        Fusb302RegUpdate (Context, FUSB302_REG_SWITCHES1, FUSB302_SWITCHES1_DATAROLE, 0);
-        Fusb302RegUpdate (Context, FUSB302_REG_CONTROL1, FUSB302_CONTROL1_RX_FLUSH, FUSB302_CONTROL1_RX_FLUSH);
-        Context->DataRoleDfp           = FALSE;
-        Context->MessageId             = 0;
-        Context->Contract.PdNegotiated = FALSE;
-        return EFI_PROTOCOL_ERROR;
-      }
-
       MicroSecondDelay (PD_POLL_INTERVAL_US);
       continue;
     }
@@ -628,6 +650,25 @@ Fusb302PdWaitFor (
       continue;
     }
 
+    // GoodCRC belongs to our transmit engine, not the partner's message stream.
+    if ((Count == 0) && (PD_HEADER_TYPE (Message->Header) == PD_CTRL_GOOD_CRC)) {
+      continue;
+    }
+
+    // The FUSB302 acknowledges retransmissions, but policy must process each
+    // partner message only once. Soft_Reset is always accepted, including ID 0.
+    if (!((Count == 0) && (PD_HEADER_TYPE (Message->Header) == PD_CTRL_SOFT_RESET))) {
+      if (Context->ReceivedMessageValid &&
+          (Context->ReceivedMessageId == PD_HEADER_ID (Message->Header)))
+      {
+        DEBUG ((DEBUG_INFO, "%a: duplicate message ID %u ignored\n", __func__, Context->ReceivedMessageId));
+        continue;
+      }
+
+      Context->ReceivedMessageId = (UINT8)PD_HEADER_ID (Message->Header);
+      Context->ReceivedMessageValid = TRUE;
+    }
+
     //
     // Answer what the partner asks for in passing, whatever we happen to be
     // waiting for. A request left hanging strands the partner part way through
@@ -642,16 +683,23 @@ Fusb302PdWaitFor (
     if (Count == 0) {
       switch (PD_HEADER_TYPE (Message->Header)) {
         case PD_CTRL_GET_SINK_CAP:
-          Fusb302PdAnswerGetSinkCap (Context);
+          Status = Fusb302PdAnswerGetSinkCap (Context);
+          if (EFI_ERROR (Status)) {
+            return Status;
+          }
+
           continue;
 
         case PD_CTRL_GET_SOURCE_CAP:
-          Fusb302PdAnswerGetSourceCap (Context);
+          Status = Fusb302PdAnswerGetSourceCap (Context);
+          if (EFI_ERROR (Status)) {
+            return Status;
+          }
+
           continue;
 
         case PD_CTRL_SOFT_RESET:
-          Fusb302PdAcceptSoftReset (Context);
-          continue;
+          return Fusb302PdAcceptSoftReset (Context);
 
         //
         // Swaps this driver has no path for. The power role is fixed by which
@@ -661,7 +709,11 @@ Fusb302PdWaitFor (
         case PD_CTRL_PR_SWAP:
         case PD_CTRL_DR_SWAP:
         case PD_CTRL_VCONN_SWAP:
-          Fusb302PdRejectRequest (Context, (UINT8)PD_HEADER_TYPE (Message->Header));
+          Status = Fusb302PdRejectRequest (Context, (UINT8)PD_HEADER_TYPE (Message->Header));
+          if (EFI_ERROR (Status)) {
+            return Status;
+          }
+
           continue;
 
         //
@@ -898,8 +950,9 @@ Fusb302PdHardReset (
   //
   // Both ends start counting from zero again.
   //
-  Context->MessageId             = 0;
-  Context->Contract.PdNegotiated = FALSE;
+  Context->MessageId = 0;
+  Context->ReceivedMessageValid = FALSE;
+  ZeroMem (&Context->Contract, sizeof (Context->Contract));
 
   //
   // Watch VBUS fall and rise again. Seeing it go is what tells us the source
@@ -973,7 +1026,17 @@ Fusb302PdSoftReset (
   //
   // Drop stale interrupt bits so the result read below belongs to this message.
   //
-  Fusb302RegRead (Context, FUSB302_REG_INTERRUPTA, &Value);
+  Status = Fusb302RegRead (Context, FUSB302_REG_INTERRUPTA, &Value);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  if ((Value & FUSB302_INTERRUPTA_HARDRESET) != 0) {
+    return Fusb302PdHandlePartnerHardReset (Context);
+  }
+
+  Context->ReceivedMessageValid = FALSE;
+  ZeroMem (&Context->Contract, sizeof (Context->Contract));
 
   //
   // Soft_Reset restarts both message counters and goes out as ID zero; the
@@ -997,8 +1060,13 @@ Fusb302PdSoftReset (
 
   InterruptA = 0;
   for (Waited = 0; Waited < PD_TX_RESULT_US; Waited += PD_POLL_INTERVAL_US) {
-    if (EFI_ERROR (Fusb302RegRead (Context, FUSB302_REG_INTERRUPTA, &Value))) {
-      break;
+    Status = Fusb302RegRead (Context, FUSB302_REG_INTERRUPTA, &Value);
+    if (EFI_ERROR (Status)) {
+      return Status;
+    }
+
+    if ((Value & FUSB302_INTERRUPTA_HARDRESET) != 0) {
+      return Fusb302PdHandlePartnerHardReset (Context);
     }
 
     InterruptA |= Value;
@@ -1024,30 +1092,37 @@ Fusb302PdSoftReset (
 }
 
 /**
-  Wait for the source to advertise again after it Hard Reset us.
-
-  It drops VBUS, brings it back, and only then advertises, so this allows for
-  the whole recovery rather than an ordinary response time.
+  Recover either kind of partner reset without sending a reset ourselves.
 **/
 STATIC
 EFI_STATUS
-Fusb302PdAwaitAfterPartnerHardReset (
+Fusb302PdRecoverPartnerReset (
   IN OUT FUSB302_CONTEXT  *Context,
+  IN OUT UINTN           *ResetCount,
+  IN     EFI_STATUS       ResetStatus,
   OUT    PD_MESSAGE       *Message
   )
 {
   EFI_STATUS  Status;
+  BOOLEAN     HardReset;
 
-  Status = Fusb302PdWaitFor (
-             Context,
-             TRUE,
-             PD_DATA_SOURCE_CAP,
-             PD_HARD_RESET_RECOVER_US + PD_SOURCE_CAP_RETRY_TIMEOUT_US,
-             Message
-             );
-  if (EFI_ERROR (Status)) {
-    DEBUG ((DEBUG_WARN, "%a: no Source_Capabilities after the partner's Hard Reset (%r)\n", __func__, Status));
-  }
+  Status = ResetStatus;
+  do {
+    if (++(*ResetCount) > PD_PARTNER_HARD_RESET_LIMIT) {
+      return EFI_ABORTED;
+    }
+
+    HardReset = (Status == EFI_PROTOCOL_ERROR);
+    DEBUG ((DEBUG_INFO, "%a: recovering partner %a (%u/%u)\n", __func__,
+      HardReset ? "Hard Reset" : "Soft_Reset", (UINT32)*ResetCount, PD_PARTNER_HARD_RESET_LIMIT));
+    Status = Fusb302PdWaitFor (
+               Context,
+               TRUE,
+               PD_DATA_SOURCE_CAP,
+               PD_SOURCE_CAP_RETRY_TIMEOUT_US + (HardReset ? PD_HARD_RESET_RECOVER_US : 0),
+               Message
+               );
+  } while ((Status == EFI_PROTOCOL_ERROR) || (Status == EFI_MEDIA_CHANGED));
 
   return Status;
 }
@@ -1060,6 +1135,7 @@ Fusb302PdNegotiateSink (
 {
   EFI_STATUS    Status;
   PD_MESSAGE    Message;
+  PD_MESSAGE    SourceCap;
   UINT16        Header;
   UINT32        Rdo;
   UINTN         Position;
@@ -1069,9 +1145,14 @@ Fusb302PdNegotiateSink (
   UINTN         Attempt;
   UINTN         Waited;
   UINTN         PartnerHardResets;
+  UINTN         WaitRetries;
+  UINTN         RequestCount;
+  UINT8         RejectedPdos;
 
   SinkPdos          = Context->Platform->SinkPdos;
   PartnerHardResets = 0;
+  RequestCount = 0;
+  ZeroMem (&Context->Contract, sizeof (Context->Contract));
 
   if (Fusb302PdoCount (SinkPdos) == 0) {
     DEBUG ((DEBUG_WARN, "%a: board lists nothing this port will accept\n", __func__));
@@ -1094,6 +1175,15 @@ Fusb302PdNegotiateSink (
              PD_SOURCE_CAP_TIMEOUT_US,
              &Message
              );
+  if ((Status == EFI_PROTOCOL_ERROR) || (Status == EFI_MEDIA_CHANGED)) {
+    Status = Fusb302PdRecoverPartnerReset (Context, &PartnerHardResets, Status, &Message);
+    if (EFI_ERROR (Status)) {
+      goto Disable;
+    }
+  } else if ((Status != EFI_TIMEOUT) && EFI_ERROR (Status)) {
+    goto Disable;
+  }
+
   if (EFI_ERROR (Status)) {
     //
     // Silence does not mean there is no source: once a contract exists the
@@ -1114,17 +1204,25 @@ Fusb302PdNegotiateSink (
         break;
       }
 
-      MicroSecondDelay (PD_SOFT_RESET_INTERVAL_US);
+      // A source may start advertising during the retry interval. Service
+      // it immediately rather than acknowledging into an unattended FIFO.
+      Status = Fusb302PdWaitFor (
+                 Context, TRUE, PD_DATA_SOURCE_CAP, PD_SOFT_RESET_INTERVAL_US, &Message
+                 );
+      if (Status != EFI_TIMEOUT) {
+        break;
+      }
     }
 
-    if (Status == EFI_PROTOCOL_ERROR) {
-      Status = Fusb302PdAwaitAfterPartnerHardReset (Context, &Message);
+    if ((Status == EFI_PROTOCOL_ERROR) || (Status == EFI_MEDIA_CHANGED)) {
+      Status = Fusb302PdRecoverPartnerReset (Context, &PartnerHardResets, Status, &Message);
     }
 
     if (EFI_ERROR (Status) && !Context->Platform->SelfPowered) {
       //
       // Hard Reset drops VBUS, and with it a board that runs from this port.
-      // Leave PD off instead; the source keeps the contract it already has.
+      // Retain Rd without deliberately cycling VBUS. The remaining voltage
+      // is unknown; the source may still reset independently.
       //
       DEBUG ((
         DEBUG_WARN,
@@ -1196,109 +1294,124 @@ Fusb302PdNegotiateSink (
   // not support alternate mode.
   //
   for (Attempt = 0; Attempt < PD_SOURCE_CAP_REPEAT_LIMIT; Attempt++) {
-    Status = Fusb302PdSelectPdo (&Message, SinkPdos, 0, &Position, &VoltageMv, &CurrentMa);
-    if (EFI_ERROR (Status)) {
-      DEBUG ((DEBUG_WARN, "%a: no acceptable power data object offered\n", __func__));
-      goto Disable;
-    }
+    CopyMem (&SourceCap, &Message, sizeof (SourceCap));
+    RejectedPdos = 0;
+    WaitRetries = 0;
 
-    DEBUG ((
-      DEBUG_INFO,
-      "%a: requesting object %u: %u mV, %u mA\n",
-      __func__,
-      (UINT32)Position,
-      VoltageMv,
-      CurrentMa
-      ));
-
-    Rdo = PD_RDO_FIXED (Position, CurrentMa, CurrentMa);
-
-    Header = PD_HEADER_BUILD (
-               PD_DATA_REQUEST,
-               Context->MessageId,
-               1,
-               Context->DataRoleDfp ? 1 : 0,
-               FUSB302_POWER_ROLE (Context),
-               PD_REV_2_0
-               );
-
-    Status = Fusb302PdSend (Context, Header, &Rdo);
-    if (EFI_ERROR (Status)) {
-      goto Disable;
-    }
-
-    Context->MessageId = (Context->MessageId + 1) & 0x7;
-
-    Status = Fusb302PdWaitFor (Context, FALSE, PD_CTRL_ACCEPT, PD_SENDER_RESPONSE_TIMEOUT_US, &Message);
-    if (!EFI_ERROR (Status)) {
-      //
-      // The source now moves the supply; PS_RDY says it has arrived.
-      //
-      Status = Fusb302PdWaitFor (Context, FALSE, PD_CTRL_PS_RDY, PD_PS_TRANSITION_TIMEOUT_US, &Message);
-      if (EFI_ERROR (Status) && (Status != EFI_PROTOCOL_ERROR)) {
-        DEBUG ((DEBUG_WARN, "%a: no PS_RDY after Accept (%r)\n", __func__, Status));
-        goto Disable;
-      }
-    } else if (Status != EFI_PROTOCOL_ERROR) {
-      DEBUG ((DEBUG_WARN, "%a: request not accepted (%r)\n", __func__, Status));
-      goto Disable;
-    }
-
-    if (Status == EFI_PROTOCOL_ERROR) {
-      //
-      // The source Hard Reset us instead of finishing the transition. Its
-      // next advertisement starts the negotiation over.
-      //
-      if (++PartnerHardResets > PD_PARTNER_HARD_RESET_LIMIT) {
+    for (;;) {
+      // A partner alternating Wait and fresh capabilities must not extend
+      // firmware's blocking negotiation indefinitely.
+      if (++RequestCount > PD_SINK_REQUEST_LIMIT) {
+        Status = EFI_ABORTED;
+        DEBUG ((DEBUG_WARN, "%a: Request budget exhausted\n", __func__));
         goto Disable;
       }
 
-      DEBUG ((DEBUG_INFO, "%a: source Hard Reset during negotiation; starting over\n", __func__));
+      Status = Fusb302PdSelectPdo (&SourceCap, SinkPdos, RejectedPdos, &Position, &VoltageMv, &CurrentMa);
+      if (EFI_ERROR (Status)) {
+        DEBUG ((DEBUG_WARN, "%a: no valid, unrefused power data object (%r)\n", __func__, Status));
+        goto Disable;
+      }
 
-      Status = Fusb302PdAwaitAfterPartnerHardReset (Context, &Message);
+      DEBUG ((DEBUG_INFO, "%a: requesting object %u: %u mV, %u mA\n",
+        __func__, (UINT32)Position, VoltageMv, CurrentMa));
+      Rdo = PD_RDO_FIXED (Position, CurrentMa, CurrentMa);
+      Header = PD_HEADER_BUILD (PD_DATA_REQUEST, Context->MessageId, 1,
+                 Context->DataRoleDfp ? 1 : 0, FUSB302_POWER_ROLE (Context), PD_REV_2_0);
+      Status = Fusb302PdSend (Context, Header, &Rdo);
       if (EFI_ERROR (Status)) {
         goto Disable;
       }
 
-      Attempt = (UINTN)-1;
-      continue;
+      Context->MessageId = (Context->MessageId + 1) & 0x7;
+      Status = Fusb302PdWaitFor (Context, FALSE, PD_CTRL_ACCEPT, PD_SENDER_RESPONSE_TIMEOUT_US, &Message);
+      if ((Status == EFI_PROTOCOL_ERROR) || (Status == EFI_MEDIA_CHANGED)) {
+        goto RecoverReset;
+      }
+
+      if (Status == EFI_ABORTED) {
+        if (PD_HEADER_TYPE (Message.Header) == PD_CTRL_WAIT) {
+          if (WaitRetries++ >= PD_SINK_WAIT_RETRY_LIMIT) {
+            DEBUG ((DEBUG_WARN, "%a: source kept answering Wait\n", __func__));
+            goto Disable;
+          }
+
+          DEBUG ((DEBUG_INFO, "%a: Wait; retrying object %u after %u us\n",
+            __func__, (UINT32)Position, PD_SINK_REQUEST_RETRY_US));
+          // Keep answering the partner while tSinkRequest expires. Sleeping
+          // here would miss a Soft_Reset or Get_Sink_Cap response deadline.
+          Status = Fusb302PdWaitFor (Context, TRUE, PD_DATA_SOURCE_CAP, PD_SINK_REQUEST_RETRY_US, &Message);
+          if ((Status == EFI_PROTOCOL_ERROR) || (Status == EFI_MEDIA_CHANGED)) {
+            goto RecoverReset;
+          }
+
+          if (Status == EFI_SUCCESS) {
+            CopyMem (&SourceCap, &Message, sizeof (SourceCap));
+            RejectedPdos = 0;
+            WaitRetries = 0;
+          } else if (Status != EFI_TIMEOUT) {
+            goto Disable;
+          }
+        } else {
+          RejectedPdos |= (UINT8)(1U << (Position - 1));
+          WaitRetries = 0;
+          DEBUG ((DEBUG_INFO, "%a: Reject for object %u; trying another fixed PDO\n", __func__, (UINT32)Position));
+        }
+
+        continue;
+      }
+
+      if (EFI_ERROR (Status)) {
+        DEBUG ((DEBUG_WARN, "%a: request not accepted (%r)\n", __func__, Status));
+        goto Disable;
+      }
+
+      Status = Fusb302PdWaitFor (Context, FALSE, PD_CTRL_PS_RDY, PD_PS_TRANSITION_TIMEOUT_US, &Message);
+      if ((Status == EFI_PROTOCOL_ERROR) || (Status == EFI_MEDIA_CHANGED)) {
+        goto RecoverReset;
+      }
+
+      if (EFI_ERROR (Status)) {
+        DEBUG ((DEBUG_WARN, "%a: no PS_RDY after Accept (%r)\n", __func__, Status));
+        goto Disable;
+      }
+
+      break;
     }
 
     Context->Contract.PdNegotiated = TRUE;
     Context->Contract.VoltageMv    = VoltageMv;
     Context->Contract.CurrentMa    = CurrentMa;
 
-    //
-    // Settled, unless the source immediately offers again.
-    //
-    Status = Fusb302PdWaitFor (
-               Context,
-               TRUE,
-               PD_DATA_SOURCE_CAP,
-               PD_SOURCE_CAP_REPEAT_US,
-               &Message
-               );
-    if (Status == EFI_PROTOCOL_ERROR) {
-      if (++PartnerHardResets > PD_PARTNER_HARD_RESET_LIMIT) {
-        goto Disable;
-      }
-
-      DEBUG ((DEBUG_INFO, "%a: source Hard Reset after the contract; starting over\n", __func__));
-
-      Status = Fusb302PdAwaitAfterPartnerHardReset (Context, &Message);
-      if (EFI_ERROR (Status)) {
-        goto Disable;
-      }
-
-      Attempt = (UINTN)-1;
-      continue;
-    }
-
-    if (EFI_ERROR (Status)) {
+    // Do not consume another advertisement once no Request budget remains.
+    if ((Attempt + 1) == PD_SOURCE_CAP_REPEAT_LIMIT) {
+      DEBUG ((DEBUG_INFO, "%a: completed bounded capability exchanges\n", __func__));
       break;
     }
 
+    Status = Fusb302PdWaitFor (Context, TRUE, PD_DATA_SOURCE_CAP, PD_SOURCE_CAP_REPEAT_US, &Message);
+    if ((Status == EFI_PROTOCOL_ERROR) || (Status == EFI_MEDIA_CHANGED)) {
+      goto RecoverReset;
+    }
+
+    if (Status == EFI_TIMEOUT) {
+      break;
+    }
+
+    if (EFI_ERROR (Status)) {
+      goto Disable;
+    }
+
     DEBUG ((DEBUG_INFO, "%a: source advertised again; answering\n", __func__));
+    continue;
+
+RecoverReset:
+    Status = Fusb302PdRecoverPartnerReset (Context, &PartnerHardResets, Status, &Message);
+    if (EFI_ERROR (Status)) {
+      goto Disable;
+    }
+
+    Attempt = (UINTN)-1;
   }
 
   DEBUG ((
@@ -1317,6 +1430,7 @@ Fusb302PdNegotiateSink (
   return EFI_SUCCESS;
 
 Disable:
+  DEBUG ((DEBUG_WARN, "%a: PD unconfirmed (%r); retaining Rd, VBUS voltage unknown\n", __func__, Status));
   Fusb302PdDisable (Context);
   return Status;
 }
