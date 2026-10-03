@@ -753,8 +753,8 @@ Fusb302SinkAccepts (
 /**
   Pick the best fixed supply the source offers that the board will take.
 
-  Highest voltage wins, since that is what reduces the current the board has
-  to draw. Anything above 5 V is reached only where the board listed it, the
+  Highest usable power wins; equal power prefers higher voltage to reduce
+  input current. Anything above 5 V is reached only where the board listed it, the
   VBUS path having to be rated for it.
 
   @param[out] Position   1-based index of the chosen object.
@@ -765,6 +765,7 @@ EFI_STATUS
 Fusb302PdSelectPdo (
   IN  CONST PD_MESSAGE  *SourceCap,
   IN  CONST UINT32      *SinkPdos,
+  IN  UINT8             RejectedPdos,
   OUT UINTN             *Position,
   OUT UINT32            *VoltageMv,
   OUT UINT32            *CurrentMa
@@ -776,16 +777,31 @@ Fusb302PdSelectPdo (
   UINT32  Voltage;
   UINT32  Current;
   UINT32  LimitMa;
+  UINT32  PowerMw;
+  UINT32  BestPowerMw;
 
   Count      = PD_HEADER_COUNT (SourceCap->Header);
   *Position  = 0;
   *VoltageMv = 0;
   *CurrentMa = 0;
+  BestPowerMw = 0;
+
+  // The first source object must describe a usable vSafe5V supply.
+  if ((Count == 0) ||
+      (PD_PDO_TYPE (SourceCap->Objects[0]) != PD_PDO_TYPE_FIXED) ||
+      (PD_PDO_FIXED_VOLTAGE_MV (SourceCap->Objects[0]) != 5000) ||
+      (PD_PDO_FIXED_CURRENT_MA (SourceCap->Objects[0]) == 0) ||
+      (PD_PDO_FIXED_CURRENT_MA (SourceCap->Objects[0]) > 5000))
+  {
+    return EFI_PROTOCOL_ERROR;
+  }
 
   for (Index = 0; Index < Count; Index++) {
     Pdo = SourceCap->Objects[Index];
 
-    if (PD_PDO_TYPE (Pdo) != PD_PDO_TYPE_FIXED) {
+    if (((RejectedPdos & (1U << Index)) != 0) ||
+        (PD_PDO_TYPE (Pdo) != PD_PDO_TYPE_FIXED))
+    {
       continue;
     }
 
@@ -801,14 +817,22 @@ Fusb302PdSelectPdo (
       Current
       ));
 
-    if ((Voltage == 0) || !Fusb302SinkAccepts (SinkPdos, Voltage, &LimitMa)) {
+    if ((Voltage < 5000) || (Voltage > 20000) ||
+        (Current == 0) || (Current > 5000) ||
+        !Fusb302SinkAccepts (SinkPdos, Voltage, &LimitMa) || (LimitMa == 0))
+    {
       continue;
     }
 
-    if (Voltage > *VoltageMv) {
-      *Position  = Index + 1;
-      *VoltageMv = Voltage;
-      *CurrentMa = MIN (Current, LimitMa);
+    Current = MIN (Current, LimitMa);
+    PowerMw = (Voltage * Current) / 1000;
+    if ((PowerMw > BestPowerMw) ||
+        ((PowerMw == BestPowerMw) && (Voltage > *VoltageMv)))
+    {
+      *Position   = Index + 1;
+      *VoltageMv  = Voltage;
+      *CurrentMa  = Current;
+      BestPowerMw = PowerMw;
     }
   }
 
@@ -1172,7 +1196,7 @@ Fusb302PdNegotiateSink (
   // not support alternate mode.
   //
   for (Attempt = 0; Attempt < PD_SOURCE_CAP_REPEAT_LIMIT; Attempt++) {
-    Status = Fusb302PdSelectPdo (&Message, SinkPdos, &Position, &VoltageMv, &CurrentMa);
+    Status = Fusb302PdSelectPdo (&Message, SinkPdos, 0, &Position, &VoltageMv, &CurrentMa);
     if (EFI_ERROR (Status)) {
       DEBUG ((DEBUG_WARN, "%a: no acceptable power data object offered\n", __func__));
       goto Disable;
