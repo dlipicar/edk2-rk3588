@@ -223,7 +223,7 @@ Fusb302SetTermination (
   @param[in]  Context   Driver context.
   @param[in]  Role      Role whose terminations are currently applied.
   @param[in]  UseCc2    Measure CC2 when TRUE, CC1 when FALSE.
-  @param[out] Level     Receives the BC_LVL field of STATUS0.
+  @param[out] RawStatus Receives STATUS0, including BC_LVL, VBUSOK and ACTIVITY.
 
 **/
 STATIC
@@ -232,7 +232,7 @@ Fusb302MeasureCc (
   IN  FUSB302_CONTEXT     *Context,
   IN  FUSB302_PROBE_ROLE  Role,
   IN  BOOLEAN             UseCc2,
-  OUT UINT8               *Level
+  OUT UINT8               *RawStatus
   )
 {
   EFI_STATUS  Status;
@@ -259,7 +259,7 @@ Fusb302MeasureCc (
     return Status;
   }
 
-  *Level = Status0 & FUSB302_STATUS0_BC_LVL_MASK;
+  *RawStatus = Status0;
 
   return EFI_SUCCESS;
 }
@@ -291,28 +291,35 @@ Fusb302ProbeRole (
   EFI_STATUS  Status;
   UINT8       Cc1Level;
   UINT8       Cc2Level;
+  UINT8       Cc1Status;
+  UINT8       Cc2Status;
 
   Status = Fusb302SetTermination (Context, Role);
   if (EFI_ERROR (Status)) {
     return Status;
   }
 
-  Status = Fusb302MeasureCc (Context, Role, FALSE, &Cc1Level);
+  Status = Fusb302MeasureCc (Context, Role, FALSE, &Cc1Status);
   if (EFI_ERROR (Status)) {
     return Status;
   }
 
-  Status = Fusb302MeasureCc (Context, Role, TRUE, &Cc2Level);
+  Status = Fusb302MeasureCc (Context, Role, TRUE, &Cc2Status);
   if (EFI_ERROR (Status)) {
     return Status;
   }
+
+  Cc1Level = Cc1Status & FUSB302_STATUS0_BC_LVL_MASK;
+  Cc2Level = Cc2Status & FUSB302_STATUS0_BC_LVL_MASK;
 
   DEBUG ((
     DEBUG_INFO,
-    "%a: as %a: CC1 BC_LVL %u, CC2 BC_LVL %u\n",
+    "%a: as %a: CC1 STATUS0=0x%02x BC_LVL=%u, CC2 STATUS0=0x%02x BC_LVL=%u\n",
     __func__,
     Role == Fusb302RoleSink ? "sink" : "source",
+    Cc1Status,
     Cc1Level,
+    Cc2Status,
     Cc2Level
     ));
 
@@ -367,10 +374,8 @@ Fusb302ProbeRole (
 /**
   Work out which CC pin the cable is on.
 
-  The port is dual-role on the boards this runs on, and which role applies
-  depends on what got plugged in: a charger or a host makes us the sink, while
-  a DisplayPort monitor makes us the source. Try sink first, since that is the
-  role these boards prefer, and fall back to source.
+  Try sink first. On boards that can supply this connector, also probe for a
+  sink partner if no source was found. Sink-only boards keep Rd asserted.
 
 **/
 STATIC
@@ -381,6 +386,7 @@ Fusb302DetectOrientation (
   )
 {
   EFI_STATUS  Status;
+  EFI_STATUS  RestoreStatus;
   UINTN       Waited;
 
   *Orientation             = UsbTypeCOrientationNone;
@@ -415,6 +421,16 @@ Fusb302DetectOrientation (
     return Status;
   }
 
+  //
+  // Keep sink-only boards on Rd even if no source has been detected yet.
+  // Presenting Rp would advertise a power role these boards cannot fulfill.
+  //
+  if ((Fusb302PdoCount (Context->Platform->SourcePdos) == 0) ||
+      (Context->Platform->SetVbus == NULL))
+  {
+    goto Restore;
+  }
+
   Status = Fusb302ProbeRole (Context, Fusb302RoleSource, Orientation);
 
 Restore:
@@ -423,7 +439,10 @@ Restore:
   // Rp back itself, alongside the supply it is advertising; holding one here
   // would offer a current this board has not yet decided to deliver.
   //
-  Fusb302SetTermination (Context, Fusb302RoleSink);
+  RestoreStatus = Fusb302SetTermination (Context, Fusb302RoleSink);
+  if (EFI_ERROR (RestoreStatus)) {
+    return RestoreStatus;
+  }
 
   return Status;
 }
@@ -740,6 +759,7 @@ Fusb302Start (
   EFI_I2C_IO_PROTOCOL    *I2cIo;
   FUSB302_CONTEXT        *Context;
   USB_TYPE_C_ORIENTATION Orientation;
+  UINT64                 NegotiationStart;
 
   Status = gBS->OpenProtocol (
                   ControllerHandle,
@@ -815,7 +835,17 @@ Fusb302Start (
       //
       Fusb302SourceSetVbus (Context, FALSE);
 
+      NegotiationStart = GetPerformanceCounter ();
       Status = Fusb302PdNegotiateSink (Context, Orientation);
+      DEBUG ((
+        DEBUG_INFO,
+        "%a: PHY %u sink negotiation: %r, %u ms, PD=%u\n",
+        __func__,
+        Context->TypeCPort.PhyId,
+        Status,
+        (UINT32)DivU64x32 (GetTimeInNanoSecond (GetPerformanceCounter () - NegotiationStart), 1000000),
+        Context->Contract.PdNegotiated
+        ));
 
       //
       // Alternate mode needs the PD link that negotiation leaves running. It
@@ -835,22 +865,43 @@ Fusb302Start (
       Fusb302PdSourceRun (Context, Orientation);
     }
 
-    if (Context->Contract.VoltageMv == 0) {
+    if (Context->PartnerIsSource && !Context->Contract.PdNegotiated) {
       //
-      // Nothing described the port yet, so fall back to what Type-C
-      // advertisement alone permits. The conservative 5 V / 500 mA is what any
-      // port guarantees without power delivery.
+      // Firmware may have inherited a higher-voltage contract on warm reset.
+      // Neither a failed Request nor Soft_Reset forces VBUS back to 5 V, so
+      // an unconfirmed contract must not be presented as a measured 5 V rail.
       //
-      // Note this deliberately tests the voltage rather than PdNegotiated:
-      // sourcing sets a contract from the Rp we present whether or not the
-      // sink went on to negotiate, and that is a better description of the
-      // port than this default.
-      //
+      Context->Contract.VoltageMv = 0;
+      Context->Contract.CurrentMa = 0;
+      DEBUG ((
+        DEBUG_WARN,
+        "%a: PHY %u PD unconfirmed; VBUS voltage/current unknown; "
+        "a previous PD voltage may remain\n",
+        __func__,
+        Context->TypeCPort.PhyId
+        ));
+    } else if (Context->Contract.VoltageMv == 0) {
       Context->Contract.VoltageMv = 5000;
       Context->Contract.CurrentMa = 500;
+    } else {
+      DEBUG ((
+        DEBUG_INFO,
+        "%a: PHY %u power state: PD=%u, %u mV, %u mA\n",
+        __func__,
+        Context->TypeCPort.PhyId,
+        Context->Contract.PdNegotiated,
+        Context->Contract.VoltageMv,
+        Context->Contract.CurrentMa
+        ));
     }
   } else {
-    DEBUG ((DEBUG_INFO, "%a: PHY %u Type-C port is empty\n", __func__, Context->TypeCPort.PhyId));
+    DEBUG ((
+      DEBUG_INFO,
+      "%a: PHY %u orientation unavailable (%r)\n",
+      __func__,
+      Context->TypeCPort.PhyId,
+      Status
+      ));
 
     //
     // A board that supplies this port still needs it live, so that a device
