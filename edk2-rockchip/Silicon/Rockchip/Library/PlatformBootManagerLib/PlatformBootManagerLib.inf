@@ -49,6 +49,7 @@
   MemoryAllocationLib
   PcdLib
   PrintLib
+  TimerLib
   UefiBootManagerLib
   UefiBootServicesTableLib
   UefiLib
@@ -94,5 +95,6 @@
   gEfiSimpleFileSystemProtocolGuid
   gEsrtManagementProtocolGuid
   gPlatformBootManagerProtocolGuid
+  gUsbTypeCPortProtocolGuid               ## CONSUMES
   gOhciDeviceProtocolGuid
   gRockchipPlatformPowerReadyProtocolGuid  ## PRODUCES

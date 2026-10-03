@@ -19,6 +19,7 @@
 #include <Library/DxeServicesTableLib.h>
 #include <Library/HobLib.h>
 #include <Library/PcdLib.h>
+#include <Library/TimerLib.h>
 #include <Library/UefiBootManagerLib.h>
 #include <Library/UefiLib.h>
 #include <Library/UefiRuntimeServicesTableLib.h>
@@ -32,6 +33,7 @@
 #include <Protocol/PciIo.h>
 #include <Protocol/PciRootBridgeIo.h>
 #include <Protocol/PlatformBootManager.h>
+#include <Protocol/UsbTypeCPort.h>
 #include <Guid/BootDiscoveryPolicy.h>
 #include <Guid/EventGroup.h>
 #include <Guid/NonDiscoverableDevice.h>
@@ -833,6 +835,71 @@ PlatformRegisterOptionsAndKeys (
 }
 
 //
+// Report what the Type-C drivers learned before enabling peripheral rails.
+// A failed negotiation cannot establish the voltage of a pre-existing
+// contract, so never present the non-PD fallback as a measured 5 V input.
+//
+STATIC
+VOID
+PlatformLogTypeCPowerContracts (
+  VOID
+  )
+{
+  EFI_STATUS                   Status;
+  EFI_HANDLE                   *Handles;
+  UINTN                        HandleCount;
+  UINTN                        Index;
+  USB_TYPE_C_PORT_PROTOCOL      *Port;
+  USB_TYPE_C_POWER_CONTRACT     Contract;
+
+  if (!DebugPrintLevelEnabled (DEBUG_INFO)) {
+    return;
+  }
+
+  Status = gBS->LocateHandleBuffer (
+                  ByProtocol,
+                  &gUsbTypeCPortProtocolGuid,
+                  NULL,
+                  &HandleCount,
+                  &Handles
+                  );
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_INFO, "PlatformPower: Type-C state unavailable (%r); PD unverified\n", Status));
+    return;
+  }
+
+  for (Index = 0; Index < HandleCount; Index++) {
+    Status = gBS->HandleProtocol (Handles[Index], &gUsbTypeCPortProtocolGuid, (VOID **)&Port);
+    if (EFI_ERROR (Status)) {
+      continue;
+    }
+
+    Status = Port->GetPowerContract (Port, &Contract);
+    if (EFI_ERROR (Status)) {
+      DEBUG ((DEBUG_INFO, "PlatformPower: PHY %u power state unavailable (%r)\n", Port->PhyId, Status));
+    } else if (Contract.PdNegotiated) {
+      DEBUG ((
+        DEBUG_INFO,
+        "PlatformPower: PHY %u PD contract %u mV, %u mA\n",
+        Port->PhyId,
+        Contract.VoltageMv,
+        Contract.CurrentMa
+        ));
+    } else {
+      DEBUG ((
+        DEBUG_INFO,
+        "PlatformPower: PHY %u no verified PD contract; input voltage unverified, "
+        "reported current %u mA\n",
+        Port->PhyId,
+        Contract.CurrentMa
+        ));
+    }
+  }
+
+  FreePool (Handles);
+}
+
+//
 // BDS Platform Functions
 //
 
@@ -869,7 +936,13 @@ PlatformBootManagerBeforeConsole (
   //
   // Connect all I2C controllers and devices
   //
+  DEBUG ((
+    DEBUG_INFO,
+    "PlatformPower: %Lu ms: connecting I2C devices for synchronous PD negotiation\n",
+    DivU64x32 (GetTimeInNanoSecond (GetPerformanceCounter ()), 1000000)
+    ));
   FilterAndProcess (&gEfiI2cMasterProtocolGuid, NULL, ConnectRecursively);
+  PlatformLogTypeCPowerContracts ();
 
   //
   // Signal a power-ready protocol after giving controllers that may increase
@@ -882,6 +955,11 @@ PlatformBootManagerBeforeConsole (
   // can wait on this protocol before enabling their power rails, in order to
   // prevent brownouts.
   //
+  DEBUG ((
+    DEBUG_INFO,
+    "PlatformPower: %Lu ms: I2C connection complete; releasing USB/PCIe/SATA power gate\n",
+    DivU64x32 (GetTimeInNanoSecond (GetPerformanceCounter ()), 1000000)
+    ));
   Status = gBS->InstallMultipleProtocolInterfaces (
                   &Handle,
                   &gRockchipPlatformPowerReadyProtocolGuid,

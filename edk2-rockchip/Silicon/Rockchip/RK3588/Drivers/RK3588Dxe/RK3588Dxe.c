@@ -211,7 +211,20 @@ OnPlatformPowerReady (
   IN VOID       *Context
   )
 {
+  EFI_STATUS  Status;
+  VOID        *PowerReady;
+
+  //
+  // EfiCreateProtocolNotifyEvent signals once even if no matching protocol
+  // exists yet. Keep the notification armed until power negotiation ran.
+  //
+  Status = gBS->LocateProtocol (&gRockchipPlatformPowerReadyProtocolGuid, NULL, &PowerReady);
+  if (EFI_ERROR (Status)) {
+    return;
+  }
+
   gBS->CloseEvent (Event);
+  DEBUG ((DEBUG_INFO, "PlatformPower: power-ready observed; enabling configured SATA devices\n"));
   InstallSataDevices ();
 }
 
